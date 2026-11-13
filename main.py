@@ -26,8 +26,8 @@ def env(name, default):
 
 
 # ----------------------------- настройки (через переменные окружения) ---------
-TG_TOKEN = env("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = env("TELEGRAM_CHAT_ID", "")
+TG_TOKEN = env("TELEGRAM_BOT_TOKEN", "9099106402:AAEsj8EOuC-KAD3yrZN9_GEWS8xNr302Ugw")
+TG_CHAT = env("TELEGRAM_CHAT_ID", "-1003777870209")
 EXCHANGES = [e for e in env("EXCHANGES", "bybit,okx,gate,kucoin,mexc,bitget,htx,bingx").split(",") if e]
 BLACKLIST = {c.upper() for c in env("BLACKLIST", "").split(",") if c}
 
