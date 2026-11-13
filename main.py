@@ -268,10 +268,10 @@ class Scanner:
         return bool(nets) and all(n.get("withdraw") is False or n.get("deposit") is False for n in nets.values())
 
     def fresh(self, key, net, mark=True):
-        """Одна связка на монету и тип: повтор только после кулдауна или если стало лучше на 1 п.п."""
+        """Одна связка на монету и тип: повтор после кулдауна или если стало лучше в 1.5 раза (и минимум на 1 п.п.)."""
         prev = self.sent.get(key)
         now = time.time()
-        if prev and now - prev[0] < COOLDOWN and net < prev[1] + 0.01:
+        if prev and now - prev[0] < COOLDOWN and net < max(prev[1] + 0.01, prev[1] * 1.5):
             return False
         if mark:
             self.sent[key] = (now, net)
@@ -360,6 +360,8 @@ class Scanner:
                 if not self.fresh(("H", coin), net):
                     continue
                 locked = kind == "SF" and self.locked(coin, b_id)
+                if kind == "SF" and not locked and not ((self.currencies.get(b_id) or {}).get(coin) or {}).get("networks"):
+                    locked = None  # статус сетей на споте неизвестен
                 await self.emit(self.msg_hedge(kind, coin, b_id, s_id, spread, net, p_long, p_short, f_long, f_short, locked))
 
     async def funding(self, ex_id, sym):
@@ -410,6 +412,7 @@ class Scanner:
             f"После комиссий (вход+выход) ≈ <b>+{net * 100:.2f}%</b>, на ${CFG['size']:.0f} ≈ ${CFG['size'] * net:.2f}\n"
             f"{fund_txt}"
             + (f"⚠️ На {nm(b_id)} по {c} закрыт вывод/депозит — спот может долго не сходиться.\n" if locked else "")
+            + (f"❔ Статус вывода {c} на {nm(b_id)} неизвестен (нужен API-ключ) — проверь вручную.\n" if locked is None else "")
             + f"Плечо 1–2x и запас маржи: цена может сначала разойтись сильнее."
         )
 
