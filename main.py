@@ -26,10 +26,12 @@ def env(name, default):
 
 
 # ----------------------------- настройки (через переменные окружения) ---------
-TG_TOKEN = env("TELEGRAM_BOT_TOKEN", "9099106402:AAEsj8EOuC-KAD3yrZN9_GEWS8xNr302Ugw")
-TG_CHAT = env("TELEGRAM_CHAT_ID", "-1003777870209")
+TG_TOKEN = env("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = env("TELEGRAM_CHAT_ID", "")    # куда слать сигналы (личка или группа)
+TG_ADMIN = env("TELEGRAM_ADMIN_ID", "")  # user id того, кто управляет ботом
 EXCHANGES = [e for e in env("EXCHANGES", "bybit,okx,gate,kucoin,mexc,bitget,htx,bingx").split(",") if e]
-BLACKLIST = {c.upper() for c in env("BLACKLIST", "").split(",") if c}
+# по умолчанию — pre-IPO перпы: на разных биржах это разные синтетические контракты, цены не обязаны сходиться
+BLACKLIST = {c.upper() for c in env("BLACKLIST", "OPENAI,ANTHROPIC").split(",") if c}
 
 CFG = {
     "size": float(env("SIZE_USDT", 500)),           # объём одной связки, USDT
@@ -43,12 +45,16 @@ SCAN_EVERY = int(env("SCAN_INTERVAL_SEC", 30))
 COOLDOWN = int(env("COOLDOWN_MIN", 30)) * 60        # не повторять ту же связку чаще
 MAX_CHECKS = int(env("MAX_CHECKS", 12))             # сколько кандидатов проверять стаканом за цикл
 ALLOW_UNVERIFIED = env("ALLOW_UNVERIFIED", "0") == "1"  # слать связки, где сеть не удалось проверить
+MAX_NEG_FUNDING = float(env("MAX_NEG_FUNDING_PCT", 0.1))  # хедж: макс. фандинг против позиции за период, %
 ENABLE_TRANSFER = env("ENABLE_TRANSFER", "1") == "1"
 ENABLE_HEDGE = env("ENABLE_HEDGE", "1") == "1"
 
 # Комиссии тейкера (доля). Поправь под свои уровни, если есть скидки.
 SPOT_FEE = {"default": 0.001, "htx": 0.002, "mexc": 0.0005}
 FUT_FEE = {"default": 0.0006, "bybit": 0.00055, "okx": 0.0005, "gate": 0.0005, "mexc": 0.0002}
+
+# глубина стакана: у части бирж разрешены только свои значения
+BOOK_LIMIT = {"htx": 150, "kucoin": 100}
 
 NAMES = {"bybit": "Bybit", "okx": "OKX", "gate": "Gate", "kucoin": "KuCoin", "mexc": "MEXC",
          "bitget": "Bitget", "htx": "HTX", "bingx": "BingX", "binance": "Binance"}
@@ -60,7 +66,14 @@ NET_ALIASES = {
     "SOL": ["SOL", "SOLANA", "SPL"],
     "ARBITRUM": ["ARB", "ARBITRUM", "ARBONE", "ARBITRUMONE", "ARBEVM"],
     "OPTIMISM": ["OP", "OPTIMISM", "OPTIMISMETH", "OPETH"],
-    "POLYGON": ["MATIC", "POLYGON", "POL", "PLASMA"],
+    "POLYGON": ["MATIC", "POLYGON", "POL"],
+    "PLASMA": ["PLASMA", "XPL"],
+    "MONAD": ["MON", "MONAD"],
+    "KAIA": ["KAIA", "KLAY", "KLAYTN"],
+    "STARKNET": ["STARK", "STARKNET"],
+    "SONIC": ["S", "SONIC"],
+    "POLKADOT": ["DOT", "POLKADOT"],
+    "BERACHAIN": ["BERA", "BERACHAIN"],
     "AVAXC": ["AVAXC", "AVAXCCHAIN", "CCHAIN", "AVALANCHEC", "AVAXCC"],
     "BASE": ["BASE", "BASEEVM"],
     "TON": ["TON", "TONCOIN"],
@@ -213,7 +226,11 @@ class Scanner:
         return {i: t for i, t in res if t}
 
     async def book(self, ex, sym):
-        ob = await asyncio.wait_for(ex.fetch_order_book(sym, 50), 15)
+        try:
+            ob = await asyncio.wait_for(ex.fetch_order_book(sym, BOOK_LIMIT.get(ex.id, 50)), 15)
+        except (ccxt.BadRequest, ccxt.ArgumentsRequired, ccxt.NotSupported):
+            # биржа не приняла такую глубину — берём её глубину по умолчанию
+            ob = await asyncio.wait_for(ex.fetch_order_book(sym), 15)
         m = ex.markets.get(sym) or {}
         k = (m.get("contractSize") or 1) if m.get("contract") else 1
         return [(p, a * k) for p, a, *_ in ob["asks"]], [(p, a * k) for p, a, *_ in ob["bids"]]
@@ -245,12 +262,19 @@ class Scanner:
             return "ok", best[1], best[2]
         return ("unknown" if unknown else "closed"), None, None
 
-    def fresh(self, key, net):
+    def locked(self, coin, ex_id):
+        """True, если на бирже по монете закрыт вывод или депозит во всех сетях (цена может не сойтись)."""
+        nets = ((self.currencies.get(ex_id) or {}).get(coin) or {}).get("networks") or {}
+        return bool(nets) and all(n.get("withdraw") is False or n.get("deposit") is False for n in nets.values())
+
+    def fresh(self, key, net, mark=True):
+        """Одна связка на монету и тип: повтор только после кулдауна или если стало лучше на 1 п.п."""
         prev = self.sent.get(key)
         now = time.time()
         if prev and now - prev[0] < COOLDOWN and net < prev[1] + 0.01:
             return False
-        self.sent[key] = (now, net)
+        if mark:
+            self.sent[key] = (now, net)
         return True
 
     # ---- один проход ----
@@ -285,6 +309,8 @@ class Scanner:
             for raw, coin, b_id, s_id, q, r in pairs(spot, spot, False, CFG["min_net"] / 100):
                 if checked >= MAX_CHECKS:
                     break
+                if not self.fresh(("T", coin), raw, mark=False):  # net <= raw, стаканы можно не трогать
+                    continue
                 status, net_name, wfee = self.route(coin, b_id, s_id, q["ask"])
                 if status == "closed" or (status == "unknown" and not ALLOW_UNVERIFIED):
                     continue
@@ -299,7 +325,7 @@ class Scanner:
                 if not res or res[0] * 100 < CFG["min_net"]:
                     continue
                 net, p_buy, p_sell = res
-                if not self.fresh(("T", coin, b_id, s_id), net):
+                if not self.fresh(("T", coin), net):
                     continue
                 await self.emit(self.msg_transfer(coin, b_id, s_id, net, p_buy, p_sell, raw, status, net_name, wfee, q, r))
 
@@ -307,7 +333,13 @@ class Scanner:
             cands = [("SF",) + c for c in pairs(spot, swap, True, CFG["min_hedge"] / 100)]
             cands += [("FF",) + c for c in pairs(swap, swap, False, CFG["min_hedge"] / 100)]
             cands.sort(key=lambda x: -x[1])
-            for kind, raw, coin, b_id, s_id, q, r in cands[:MAX_CHECKS]:
+            checked = 0
+            for kind, raw, coin, b_id, s_id, q, r in cands:
+                if checked >= MAX_CHECKS:
+                    break
+                if not self.fresh(("H", coin), raw, mark=False):
+                    continue
+                checked += 1
                 long_ex = self.spot[b_id] if kind == "SF" else self.swap[b_id]
                 fee_long = fee(SPOT_FEE if kind == "SF" else FUT_FEE, b_id)
                 try:
@@ -320,11 +352,15 @@ class Scanner:
                 if not res or res[1] * 100 < CFG["min_hedge"]:
                     continue
                 spread, net, p_long, p_short = res
-                if not self.fresh((kind, coin, b_id, s_id), net):
-                    continue
                 f_short = await self.funding(s_id, r["sym"])
                 f_long = await self.funding(b_id, q["sym"]) if kind == "FF" else None
-                await self.emit(self.msg_hedge(kind, coin, b_id, s_id, spread, net, p_long, p_short, f_long, f_short))
+                # спред, который держится на фандинге против нас, — не арбитраж
+                if ((f_short or 0) - (f_long or 0)) * 100 < -MAX_NEG_FUNDING:
+                    continue
+                if not self.fresh(("H", coin), net):
+                    continue
+                locked = kind == "SF" and self.locked(coin, b_id)
+                await self.emit(self.msg_hedge(kind, coin, b_id, s_id, spread, net, p_long, p_short, f_long, f_short, locked))
 
     async def funding(self, ex_id, sym):
         try:
@@ -356,17 +392,16 @@ class Scanner:
             f"Перед входом сверь контракт монеты и что депозит открыт."
         )
 
-    def msg_hedge(self, kind, coin, b_id, s_id, spread, net, p_long, p_short, f_long, f_short):
+    def msg_hedge(self, kind, coin, b_id, s_id, spread, net, p_long, p_short, f_long, f_short, locked=False):
         c = html.escape(coin)
         title = "спот → фьючерс" if kind == "SF" else "фьючерс → фьючерс"
         leg1 = (f"1. Купить спот на <b>{nm(b_id)}</b> ≈ {fp(p_long)}" if kind == "SF"
                 else f"1. Лонг перп на <b>{nm(b_id)}</b> ≈ {fp(p_long)}")
-        fund = []
-        if f_long is not None:
-            fund.append(f"лонг {nm(b_id)} {f_long * 100:+.4f}%")
-        if f_short is not None:
-            fund.append(f"шорт {nm(s_id)} {f_short * 100:+.4f}%")
-        fund_txt = ("Фандинг: " + ", ".join(fund) + " (плюс у шорта — платят тебе)\n") if fund else ""
+        fund_txt = ""
+        if f_short is not None and (kind == "SF" or f_long is not None):
+            carry = (f_short - (f_long or 0)) * 100  # сколько связка получает (+) или платит (-) за период
+            side = "тебе платят" if carry > 0 else ("платишь ты" if carry < 0 else "ноль")
+            fund_txt = f"Фандинг связки: {carry:+.3f}% за период ({side})\n"
         return (
             f"⚖️ <b>{c}</b> — {title}, спред <b>{spread * 100:.2f}%</b>\n\n"
             f"{leg1}\n"
@@ -374,7 +409,8 @@ class Scanner:
             f"3. Закрыть обе ноги, когда цены сойдутся\n\n"
             f"После комиссий (вход+выход) ≈ <b>+{net * 100:.2f}%</b>, на ${CFG['size']:.0f} ≈ ${CFG['size'] * net:.2f}\n"
             f"{fund_txt}"
-            f"Плечо 1–2x и запас маржи: цена может сначала разойтись сильнее."
+            + (f"⚠️ На {nm(b_id)} по {c} закрыт вывод/депозит — спот может долго не сходиться.\n" if locked else "")
+            + f"Плечо 1–2x и запас маржи: цена может сначала разойтись сильнее."
         )
 
 
@@ -412,12 +448,18 @@ class Telegram:
                 self.offset = upd["update_id"] + 1
                 msg = upd.get("message") or {}
                 text, chat = (msg.get("text") or "").strip(), str((msg.get("chat") or {}).get("id", ""))
+                uid = str((msg.get("from") or {}).get("id", ""))
                 if not text.startswith("/"):
                     continue
-                if self.chat and chat != self.chat:
-                    await self.send(f"Твой chat id: <code>{chat}</code>", chat)
+                cmd = text.split()[0].split("@")[0].lower()
+                ids = f"id этого чата: <code>{chat}</code>\nтвой user id: <code>{uid}</code>"
+                # управлять может только админ (TELEGRAM_ADMIN_ID); если он не задан — только чат сигналов
+                allowed = (uid == TG_ADMIN) if TG_ADMIN else (not self.chat or chat == self.chat)
+                if not allowed:
+                    if cmd in ("/start", "/id") and (not TG_ADMIN or not self.chat):
+                        await self.send(ids, chat)  # подсказка id, пока настройка не закончена
                     continue
-                await self.send(command(text, chat, scanner), chat)
+                await self.send(ids if cmd == "/id" else command(text, chat, scanner), chat)
             if not data.get("ok"):
                 await asyncio.sleep(5)
 
@@ -436,7 +478,7 @@ def command(text, chat, sc):
     if cmd == "/start" or cmd == "/help":
         return (f"Арбитражный сканер.\nТвой chat id: <code>{chat}</code>\n\n"
                 "/status — состояние\n/min 1.5 — мин. чистый % (перевод)\n/hedge 1.5 — мин. чистый % (хедж)\n"
-                "/size 500 — объём связки в USDT\n/pause и /resume — пауза")
+                "/size 500 — объём связки в USDT\n/pause и /resume — пауза\n/id — id чата и твой user id")
     if cmd == "/status":
         s = sc.stats
         ago = f"{time.time() - s['last']:.0f} сек назад" if s["last"] else "ещё не было"
@@ -489,7 +531,7 @@ async def main():
     asyncio.create_task(tg.poll(sc))
     await sc.load()
     await sc.refresh_currencies()
-    await tg.send("Сканер запущен.\n" + command("/status", TG_CHAT, sc))
+    await tg.send("Сканер запущен.\n" + command("/status", TG_CHAT, sc), TG_ADMIN or None)
     last_cur = time.time()
     try:
         while True:
